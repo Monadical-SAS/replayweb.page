@@ -5,11 +5,12 @@ import rwpLogoAnimated from "~assets/brand/replaywebpage-icon-color-animated.svg
 
 import prettyBytes from "pretty-bytes";
 
-import { parseURLSchemeHostPath } from "./pageutils";
+import { parseURLSchemeHostPath, digestMessage } from "./pageutils";
 import { property } from "lit/decorators.js";
 import type { LoadInfo } from "./item";
 import { ifDefined } from "lit/directives/if-defined.js";
 import { serviceWorkerActivated } from "./swmanager";
+import { FileWithPath } from "./chooser";
 
 // ===========================================================================
 /**
@@ -20,7 +21,20 @@ type LoadingState =
   | "waiting"
   | "googledrive"
   | "errored"
-  | "permission_needed";
+  | "permission_needed"
+  | "webtorrent";
+
+type ExtendedLoadInfo = LoadInfo & {
+  isFile?: boolean;
+  loadUrl?: string;
+  noCache?: boolean;
+  extra?: { fileHandle: FileSystemFileHandle } | { isMagnet: boolean };
+  blob?: Blob;
+  size?: number;
+  name?: string;
+  newFullImport?: boolean;
+  alreadyLoaded?: boolean;
+};
 
 const NO_ANIM_STATES: LoadingState[] = [
   "errored",
@@ -45,6 +59,16 @@ class Loader extends LitElement {
   @property({ type: Boolean }) errorAllowRetry = false;
   @property({ type: String }) extraMsg?: string;
   @property({ type: String }) swName?: string;
+  @property({ type: Object })
+  torrentInfo: {
+    peers?: number;
+    progress?: number;
+    downloadSpeed?: number;
+    uploadSpeed?: number;
+    numFound?: number;
+  } = {};
+
+  private torrentClient: any = null;
 
   pingInterval: number | NodeJS.Timer = 0;
   // eslint-disable-next-line @typescript-eslint/no-explicit-any -- requestPermission() type mismatch
@@ -159,6 +183,12 @@ class Loader extends LitElement {
       return;
     }
 
+    if (sourceUrl?.startsWith("magnet:?")) {
+      this.state = "webtorrent";
+      await this.handleMagnetLink(sourceUrl);
+      return;
+    }
+
     // custom protocol handlers here...
     try {
       const { scheme, host, path } = parseURLSchemeHostPath(sourceUrl!);
@@ -247,6 +277,160 @@ You can select a file to upload from the main page by clicking the 'Choose File.
           // @ts-expect-error - TS2531 - Object is possibly 'null'.
           navigator.serviceWorker.controller.postMessage({ msg_type: "ping" });
         }, 15000);
+      }
+    }
+  }
+
+  async handleMagnetLink(magnetURI: string) {
+    // If WebTorrent is not available, show an error
+    if (!window.WebTorrent) {
+      this.state = "errored";
+      this.error =
+        "WebTorrent is not available. Please ensure the WebTorrent library is properly loaded.";
+      return;
+    }
+
+    try {
+      if (this.torrentClient) {
+        this.torrentClient.destroy();
+      }
+
+      this.torrentClient = new window.WebTorrent();
+      this.torrentInfo = {
+        peers: 0,
+        progress: 0,
+        downloadSpeed: 0,
+        uploadSpeed: 0,
+        numFound: 0,
+      };
+
+      // Set up torrent event listeners for UI updates
+      const torrent = this.torrentClient.add(magnetURI, (torrent: any) => {
+        // Find a supported web archive file
+        const supportedFile = torrent.files.find((file: any) =>
+          /\.(warc|wacz|har)(\.gz)?$/i.test(file.name),
+        );
+
+        if (!supportedFile) {
+          this.state = "errored";
+          this.error =
+            "No compatible web archive file found in torrent. Only WARC, WACZ, or HAR files are supported.";
+          this.torrentClient.destroy();
+          this.torrentClient = null;
+          return;
+        }
+
+        this.torrentInfo.numFound = 1;
+        this.requestUpdate();
+
+        // When the file is done downloading, load it into the archive
+        supportedFile.getBlob(async (err: any, blob: Blob) => {
+          if (err) {
+            this.state = "errored";
+            this.error = `Error downloading file: ${err.message || err}`;
+            this.torrentClient.destroy();
+            this.torrentClient = null;
+            return;
+          }
+
+          try {
+            // Create a File object from the blob
+            const file: FileWithPath = new File([blob], supportedFile.name, {
+              type: blob.type,
+            }) as FileWithPath;
+
+            const digest = await digestMessage(magnetURI, "SHA-256");
+            const collId = "id-" + digest.slice(0, 12);
+
+            // Set the collection ID for this loader instance
+            this.coll = collId;
+
+            const objectUrl = URL.createObjectURL(blob);
+
+            // Create a more complete loadInfo
+            const loadInfo: LoadInfo = {
+              sourceUrl: magnetURI,
+              loadUrl: objectUrl,
+              name: file.name,
+            };
+
+            // Use the existing worker infrastructure to register this collection
+            const msg = {
+              msg_type: "addColl",
+              name: collId,
+              skipExisting: true,
+              file: loadInfo,
+            };
+
+            // Send the message to register the collection
+            if (this.worker) {
+              if (!this.noWebWorker) {
+                this.worker.postMessage(msg);
+              } else if (navigator.serviceWorker.controller) {
+                navigator.serviceWorker.controller.postMessage(msg);
+              }
+            }
+
+            // THIS can probably be done better but it works for now
+            document.dispatchEvent(
+              new CustomEvent("magnet-file-created", {
+                detail: { file },
+              }),
+            );
+
+            // Clean up WebTorrent
+            this.torrentClient.destroy();
+            this.torrentClient = null;
+          } catch (e) {
+            this.state = "errored";
+            this.error = `Error processing downloaded file: ${
+              e instanceof Error ? e.message : String(e)
+            }`;
+          }
+        });
+      });
+
+      // Set up UI update events
+      torrent.on("download", () => {
+        this.currentSize = torrent.downloaded;
+        this.totalSize = torrent.length;
+        this.percent = Math.floor(torrent.progress * 100);
+        this.torrentInfo = {
+          peers: torrent.numPeers,
+          progress: torrent.progress,
+          downloadSpeed: torrent.downloadSpeed,
+          uploadSpeed: torrent.uploadSpeed,
+          numFound: this.torrentInfo.numFound,
+        };
+        this.requestUpdate();
+      });
+
+      torrent.on("wire", () => {
+        this.torrentInfo.peers = torrent.numPeers;
+        this.requestUpdate();
+      });
+
+      torrent.on("noPeers", (announceType: string) => {
+        this.extraMsg = `No peers found (${announceType}). Searching...`;
+        this.requestUpdate();
+      });
+
+      torrent.on("error", (err: Error) => {
+        this.state = "errored";
+        this.error = `WebTorrent error: ${err.message || String(err)}`;
+        if (this.torrentClient) {
+          this.torrentClient.destroy();
+          this.torrentClient = null;
+        }
+      });
+    } catch (e) {
+      this.state = "errored";
+      this.error = `WebTorrent error: ${
+        e instanceof Error ? e.message : String(e)
+      }`;
+      if (this.torrentClient) {
+        this.torrentClient.destroy();
+        this.torrentClient = null;
       }
     }
   }
@@ -384,6 +568,35 @@ You can select a file to upload from the main page by clicking the 'Choose File.
 
   renderContent() {
     switch (this.state) {
+      case "webtorrent":
+        return html` <div class="progress-div">
+          ${this.renderProgressBar()}
+          <div class="torrent-stats">
+            <p>
+              ${this.torrentInfo.numFound
+                ? `Found ${this.torrentInfo.numFound} compatible file${
+                    this.torrentInfo.numFound !== 1 ? "s" : ""
+                  }`
+                : "Searching for compatible files..."}
+            </p>
+            <p>
+              Connected to ${this.torrentInfo.peers || 0}
+              peer${this.torrentInfo.peers !== 1 ? "s" : ""}
+            </p>
+            <p>
+              Download speed:
+              ${prettyBytes(this.torrentInfo.downloadSpeed || 0)}/s
+            </p>
+            <p>
+              Upload speed: ${prettyBytes(this.torrentInfo.uploadSpeed || 0)}/s
+            </p>
+          </div>
+          ${!this.embed
+            ? html` <button @click="${this.onCancel}" class="button is-danger">
+                Cancel
+              </button>`
+            : ""}
+        </div>`;
       case "googledrive":
         return html`<wr-gdrive
           .sourceUrl=${this.sourceUrl!}

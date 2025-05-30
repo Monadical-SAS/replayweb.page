@@ -1,8 +1,25 @@
+// chooser.ts:
 import { LitElement, html, css, type PropertyValues } from "lit";
 import { IS_APP, wrapCss } from "./misc";
 
 import fasUpload from "@fortawesome/fontawesome-free/svgs/solid/upload.svg";
 import { customElement, property } from "lit/decorators.js";
+
+declare global {
+  interface Window {
+    WebTorrent: new (...args: any[]) => {
+      add(
+        torrentId: string,
+        callback: (torrent: {
+          files: {
+            name: string;
+            getBlob: (cb: (err: any, blob: Blob) => void) => void;
+          }[];
+        }) => void,
+      ): void;
+    };
+  }
+}
 
 export interface FileWithPath extends File {
   path: string;
@@ -54,6 +71,37 @@ export class Chooser extends LitElement {
 
   fileHandle?: FileSystemFileHandle;
 
+  connectedCallback() {
+    super.connectedCallback();
+
+    // Add the event listener for magnet file creation
+    document.addEventListener(
+      "magnet-file-created",
+      this.onMagnetFileCreated as EventListener,
+    );
+  }
+
+  disconnectedCallback() {
+    super.disconnectedCallback();
+
+    // Clean up by removing the event listener
+    document.removeEventListener(
+      "magnet-file-created",
+      this.onMagnetFileCreated as EventListener,
+    );
+  }
+
+  private onMagnetFileCreated = (event: CustomEvent) => {
+    const file = event.detail.file as FileWithPath;
+    if (file) {
+      this.setFile(file);
+      this.dispatchEvent(
+        new CustomEvent("did-drop-file", { bubbles: true, composed: true }),
+      );
+      this.onStartLoad();
+    }
+  };
+
   updated(changedProperties: PropertyValues<this>) {
     if (changedProperties.has("droppedFile") && this.droppedFile) {
       this.onDropFile();
@@ -99,7 +147,8 @@ export class Chooser extends LitElement {
       this.file.path = window.electron.getPath(this.file);
     }
 
-    this.fileDisplayName = "file://" + (file.path || file.name);
+    this.fileDisplayName =
+      "file://" + encodeURIComponent(file.path || file.name);
   }
 
   async onChooseNativeFile() {
@@ -135,7 +184,7 @@ export class Chooser extends LitElement {
       isFile?: boolean;
       loadUrl?: string;
       noCache?: boolean;
-      extra?: { fileHandle: FileSystemFileHandle };
+      extra?: { fileHandle: FileSystemFileHandle } | { isMagnet: boolean };
       blob?: Blob;
       size?: number;
       name?: string;
@@ -147,11 +196,18 @@ export class Chooser extends LitElement {
       newFullImport: this.newFullImport,
     };
 
-    if (this.file) {
+    // Handle magnet links
+    if (this.fileDisplayName.startsWith("magnet:?")) {
+      loadInfo.loadUrl = this.fileDisplayName;
+      loadInfo.extra = { isMagnet: true };
+      loadInfo.isFile = false;
+      loadInfo.noCache = false;
+    } else if (this.file) {
       loadInfo.isFile = true;
-      // file.path only available in electron app
-      if (this.file.path) {
-        loadInfo.loadUrl = "file2://" + this.file.path;
+
+      // ✅ Only use file2:// if running in Electron (not browser)
+      if (IS_APP && this.file.path) {
+        loadInfo.loadUrl = "file2://" + encodeURIComponent(this.file.path);
         loadInfo.noCache = true;
       } else if (this.fileHandle) {
         loadInfo.loadUrl = this.fileDisplayName;
@@ -162,6 +218,7 @@ export class Chooser extends LitElement {
         loadInfo.blob = this.file;
         loadInfo.noCache = false;
       }
+
       loadInfo.size = this.file.size;
       loadInfo.name = this.fileDisplayName;
     }
@@ -295,7 +352,7 @@ export class Chooser extends LitElement {
                   type="text"
                   name="filename"
                   id="filename"
-                  pattern="((file|http|https|ipfs|s3)://.*.(warc|warc.gz|zip|wacz|wacz.zip|har|json|cdx|cdxj)([?#].*)?)|(googledrive://.+)|(ssb://.+)"
+                  pattern="((file|http|https|ipfs|s3)://.*.(warc|warc.gz|zip|wacz|wacz.zip|har|json|cdx|cdxj)([?#].*)?)|(googledrive://.+)|(ssb://.+)|(magnet:?.*)"
                   .value="${this.fileDisplayName}"
                   @input="${this.onInput}"
                   autocomplete="off"
